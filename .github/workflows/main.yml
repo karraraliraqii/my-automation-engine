@@ -8,6 +8,10 @@ jobs:
   repost:
     runs-on: ubuntu-latest
     steps:
+      # FIX: Added the missing checkout step. This was the main error.
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -37,22 +41,26 @@ jobs:
           from requests_oauthlib import OAuth1Session
 
           # --- Get secrets from environment ---
-          app_key = os.environ['APP_KEY']
-          app_secret = os.environ['APP_SECRET']
-          access_token = os.environ['ACCESS_TOKEN']
-          access_secret = os.environ['ACCESS_SECRET']
-          tweet_text = os.environ['TWEET_TEXT']
-          media_url = os.environ['MEDIA_URL']
+          app_key = os.environ.get('APP_KEY')
+          app_secret = os.environ.get('APP_SECRET')
+          access_token = os.environ.get('ACCESS_TOKEN')
+          access_secret = os.environ.get('ACCESS_SECRET')
+          tweet_text = os.environ.get('TWEET_TEXT')
+          media_url = os.environ.get('MEDIA_URL')
 
           if not all([app_key, app_secret, access_token, access_secret]):
-              print("::error::One or more Twitter API secrets are missing from the GitHub repository secrets.")
+              print("::error::One or more Twitter API secrets are missing from the GitHub repository secrets. Please check Settings > Secrets and variables > Actions.")
               exit(1)
 
           # --- Download the media file ---
           print(f"Downloading media from: {media_url}")
-          media_response = requests.get(media_url, stream=True)
-          media_response.raise_for_status()
-          # Use a proper extension based on content type for clarity
+          try:
+              media_response = requests.get(media_url, stream=True, timeout=30)
+              media_response.raise_for_status()
+          except requests.exceptions.RequestException as e:
+              print(f"::error::Failed to download media: {e}")
+              exit(1)
+          
           content_type = media_response.headers.get('Content-Type', 'application/octet-stream')
           extension = 'mp4' if 'video' in content_type else 'jpg' if 'image' in content_type else 'bin'
           filename = f"temp_media.{extension}"
@@ -66,7 +74,8 @@ jobs:
           # --- Step 1: Initialize Media Upload ---
           oauth = OAuth1Session(app_key, client_secret=app_secret, resource_owner_key=access_token, resource_owner_secret=access_secret)
           init_url = 'https://upload.twitter.com/1.1/media/upload.json'
-          init_params = {'command': 'INIT', 'total_bytes': file_size, 'media_type': content_type}
+          init_params = {'command': 'INIT', 'total_bytes': file_size, 'media_category': 'tweet_video' if 'video' in content_type else 'tweet_image'}
+          
           init_res = oauth.post(init_url, data=init_params)
           if init_res.status_code != 202:
               print(f"::error::Media INIT failed: {init_res.text}")
@@ -75,11 +84,10 @@ jobs:
           print(f"Media upload initialized. Media ID: {media_id}")
 
           # --- Step 2: Append Media Chunks ---
-          segment_id = 0
           with open(filename, 'rb') as f:
-              chunk = f.read() # Read the whole file since it's already downloaded
+              chunk = f.read()
               append_url = 'https://upload.twitter.com/1.1/media/upload.json'
-              append_params = {'command': 'APPEND', 'media_id': media_id, 'segment_index': segment_id}
+              append_params = {'command': 'APPEND', 'media_id': media_id, 'segment_index': '0'}
               files = {'media': chunk}
               append_res = oauth.post(append_url, data=append_params, files=files)
               if append_res.status_code not in [200, 201, 204]:
@@ -91,26 +99,37 @@ jobs:
           finalize_url = 'https://upload.twitter.com/1.1/media/upload.json'
           finalize_params = {'command': 'FINALIZE', 'media_id': media_id}
           finalize_res = oauth.post(finalize_url, data=finalize_params)
-          if finalize_res.status_code not in [200, 201]:
-              print(f"Finalize response was not successful, checking status... Response: {finalize_res.text}")
-              processing_info = finalize_res.json().get('processing_info', {})
-              state = processing_info.get('state')
+          
+          processing_info = finalize_res.json().get('processing_info', {})
+          state = processing_info.get('state')
+          
+          if state == 'succeeded':
+              print("Media finalized immediately.")
+          elif state == 'in_progress':
               wait_secs = processing_info.get('check_after_secs', 5)
-              while state == 'in_progress':
+              for _ in range(6): # Try for about 30-60 seconds
                   print(f"Media processing in progress, waiting for {wait_secs} seconds...")
                   time.sleep(wait_secs)
                   status_res = oauth.get(finalize_url, params={'command': 'STATUS', 'media_id': media_id})
                   processing_info = status_res.json().get('processing_info', {})
                   state = processing_info.get('state')
-              if state != 'succeeded':
-                  print(f"::error::Media processing failed with state: {state}. Info: {processing_info.get('error', {})}")
+                  if state == 'succeeded':
+                      print("Media processing succeeded.")
+                      break
+                  if state == 'failed':
+                      print(f"::error::Media processing failed. Error info: {processing_info.get('error')}")
+                      exit(1)
+              else: # If loop finishes without success
+                  print(f"::error::Media processing timed out.")
                   exit(1)
-          print("Media finalized successfully.")
+          else:
+              print(f"::error::Media FINALIZE failed with state '{state}'. Full response: {finalize_res.text}")
+              exit(1)
 
           # --- Step 4: Post Tweet with Media ID ---
+          print("Posting tweet with media ID...")
           tweet_url = 'https://api.twitter.com/2/tweets'
           payload = {"text": tweet_text, "media": {"media_ids": [media_id]}}
-          # The main tweet posting uses the same OAuth1 session for v2 endpoint
           tweet_res = oauth.post(tweet_url, json=payload)
           
           if tweet_res.status_code == 201:
